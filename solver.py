@@ -17,15 +17,20 @@ class GRASPConfig:
     time_limit_seconds: Optional[float] = None
     verbose: bool = True
 
+    # New:
+    # Instead of scanning all remaining candidates every step,
+    # scan only a random sample.
+    candidate_sample_size: int = 500
+
 
 def _initial_candidates(points: Sequence[Point], W: int) -> Tuple[List[int], List[int]]:
     """
-    Finds points that are even possible to upgrade at the beginning.
+    Finds points that are possible to upgrade at the beginning.
 
     If the best unweighted chain through point i has length T[i],
     then upgrading i adds 2.
 
-    So initially, i can only be considered if:
+    Initially, i can only be considered if:
         T[i] + 2 <= W
     """
 
@@ -42,6 +47,44 @@ def _initial_candidates(points: Sequence[Point], W: int) -> Tuple[List[int], Lis
     return candidates, through
 
 
+def _build_legal_candidates_from_list(
+    candidate_indices: Sequence[int],
+    remaining: Set[int],
+    current_through: Sequence[int],
+    base_through: Sequence[int],
+    W: int,
+    rng: random.Random,
+) -> List[Tuple[int, int, float, int]]:
+    """
+    Builds scored legal candidates from a given list of candidate indices.
+
+    Returns tuples:
+        (current_slack, initial_slack, random_tiebreaker, point_index)
+
+    Higher tuple is better because we sort reverse=True.
+    """
+
+    legal_candidates = []
+
+    for i in candidate_indices:
+        if i not in remaining:
+            continue
+
+        if current_through[i] + 2 <= W:
+            current_slack = W - current_through[i]
+            initial_slack = W - base_through[i]
+
+            legal_candidates.append(
+                (current_slack, initial_slack, rng.random(), i)
+            )
+        else:
+            # Since weights only increase, a point that is illegal now
+            # will not become legal later.
+            remaining.remove(i)
+
+    return legal_candidates
+
+
 def _construct_one_solution(
     points: Sequence[Point],
     W: int,
@@ -53,7 +96,10 @@ def _construct_one_solution(
     """
     One GRASP construction phase.
 
-    Builds one terminal feasible solution using randomized greedy choices.
+    Builds one feasible terminal-like solution using randomized greedy choices.
+
+    This version samples candidates instead of scanning all remaining candidates
+    every step.
     """
 
     n = len(points)
@@ -62,27 +108,41 @@ def _construct_one_solution(
     remaining: Set[int] = set(initial_candidates)
 
     while remaining:
+        # This is still the expensive part.
+        # It recomputes the current best weighted chain through every point.
         _, _, current_through = compute_LRT(points, weights)
 
-        legal_candidates = []
+        # Sample candidates instead of checking all of them every round.
+        sample_size = min(config.candidate_sample_size, len(remaining))
+        sampled_candidates = rng.sample(list(remaining), sample_size)
 
-        # Remove candidates that are no longer legal.
-        # Since weights only increase, an illegal candidate will never become legal later.
-        for i in list(remaining):
-            if current_through[i] + 2 <= W:
-                current_slack = W - current_through[i]
-                initial_slack = W - base_through[i]
+        legal_candidates = _build_legal_candidates_from_list(
+            candidate_indices=sampled_candidates,
+            remaining=remaining,
+            current_through=current_through,
+            base_through=base_through,
+            W=W,
+            rng=rng,
+        )
 
-                # Higher score is better.
-                legal_candidates.append(
-                    (current_slack, initial_slack, rng.random(), i)
-                )
-            else:
-                remaining.remove(i)
-
+        # If the random sample found no legal candidate,
+        # do one full scan before stopping.
+        # This prevents stopping too early just because the sample was unlucky.
         if not legal_candidates:
-            break
+            legal_candidates = _build_legal_candidates_from_list(
+                candidate_indices=list(remaining),
+                remaining=remaining,
+                current_through=current_through,
+                base_through=base_through,
+                W=W,
+                rng=rng,
+            )
 
+            if not legal_candidates:
+                break
+
+        # Greedy-randomized selection:
+        # sort candidates by score, take top rcl_size, choose randomly from them.
         legal_candidates.sort(reverse=True)
 
         rcl_length = min(config.rcl_size, len(legal_candidates))
@@ -132,6 +192,8 @@ def solve_grasp(points: Sequence[Point], config: Optional[GRASPConfig] = None) -
     if config.verbose:
         print(f"W = {W}")
         print(f"Initial possible candidates = {len(initial_candidates)}")
+        print(f"RCL size = {config.rcl_size}")
+        print(f"Candidate sample size = {config.candidate_sample_size}")
 
     for iteration in range(config.iterations):
         if config.time_limit_seconds is not None:
